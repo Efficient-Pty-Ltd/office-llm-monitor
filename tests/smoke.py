@@ -26,7 +26,20 @@ def get(path, want_json=True):
         return json.loads(body) if want_json else body
 
 
+def exits_without_tailnet():
+    # The box booted with the monitor ahead of tailscale, fell back to 127.0.0.1, and showed the
+    # model down for 18 minutes while it was answering. With no tailscale address and no --llm,
+    # the monitor must exit so systemd retries, not start watching the wrong address.
+    empty = tempfile.mkdtemp()                    # PATH with no tailscale binary on it
+    r = subprocess.run([sys.executable, os.path.join(ROOT, 'llm_monitor.py'), '--host', '127.0.0.1',
+                        '--port', str(MON_PORT), '--db', os.path.join(empty, 'x.db')],
+                       env=dict(os.environ, PATH=empty), capture_output=True, text=True, timeout=20)
+    assert r.returncode != 0, 'started without a tailscale address (exit %s)' % r.returncode
+    assert 'no tailscale IPv4' in r.stderr, 'unexpected stderr: %r' % r.stderr[-200:]
+
+
 def main():
+    check('exits when tailscale has no address yet', exits_without_tailnet)
     db = tempfile.mktemp(suffix='.db')
     fake = subprocess.Popen([sys.executable, os.path.join(HERE, 'fake_llama.py'), str(FAKE_PORT)])
     mon = subprocess.Popen([sys.executable, os.path.join(ROOT, 'llm_monitor.py'),

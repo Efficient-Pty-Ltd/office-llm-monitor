@@ -6,7 +6,7 @@ Serves the monitor page and its JSON on the tailnet address only.
   request log : the llm.service journal (print_timing / release lines), kept in SQLite
 Standard library only.
 """
-import argparse, datetime as dt, json, os, re, sqlite3, subprocess, threading, time, urllib.request
+import argparse, datetime as dt, json, os, re, sqlite3, subprocess, sys, threading, time, urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -25,7 +25,12 @@ def sh(cmd, timeout=10):
     except Exception:
         return ''
 
-TS_IP = sh(['tailscale', 'ip', '-4']).strip().splitlines()[0] if sh(['tailscale', 'ip', '-4']).strip() else '127.0.0.1'
+TS_IP = (sh(['tailscale', 'ip', '-4']).strip().splitlines() or [''])[0]
+if not TS_IP and not (ARGS.host and ARGS.llm):
+    # llama-server listens on the tailnet address only, so a 127.0.0.1 fallback watches nothing and
+    # reports the model down until someone restarts us. At boot we can start before tailscale has an
+    # address; exiting lets systemd's Restart=always retry until it does.
+    sys.exit('llm_monitor: no tailscale IPv4 yet; pass --host and --llm to run without tailscale')
 HOST = ARGS.host or TS_IP
 LLM = ARGS.llm or f'http://{TS_IP}:8080'
 LLM_PORT = int(urlparse(LLM).port or 8080)

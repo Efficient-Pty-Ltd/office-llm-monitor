@@ -32,6 +32,10 @@ python3 llm_monitor.py --port 8765 --llm http://localhost:8080
 | `--page` | `monitor_page.html` | the page to serve |
 | `--db` | `monitor.db` | where history is kept (SQLite, created on first run) |
 
+Without both `--host` and `--llm`, the monitor needs a tailscale address and exits if there is
+none yet, so systemd retries it at boot instead of watching `127.0.0.1`, where llama-server does
+not listen.
+
 Nothing about a conversation is stored: the database holds token counts, timings and the
 caller's name, never a prompt or an answer.
 
