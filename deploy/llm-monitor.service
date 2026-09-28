@@ -10,10 +10,11 @@ User=efficient
 Group=efficient
 WorkingDirectory=/home/efficient/office-llm-monitor
 Environment=TZ=Australia/Sydney
-# 0.0.0.0 so the office LAN can reach the page directly as well as through `tailscale serve`.
-# Only tailscale serve (connecting from localhost) may name the caller in a header; direct callers
-# are identified by their address, so the /ask allow-list cannot be claimed from the LAN.
-ExecStart=/usr/bin/python3 /home/efficient/office-llm-monitor/llm_monitor.py --host 0.0.0.0 --port 8765 --db /home/efficient/qwen-monitor/monitor.db
+# 127.0.0.1 for `tailscale serve`, which proxies the tailnet URLs here and stamps who is calling;
+# 192.168.1.148 so the office LAN can open the page directly. Not 0.0.0.0: tailscale serve already
+# holds :8765 on the tailnet address, so a wildcard bind would fail. Only tailscale serve (connecting
+# from localhost) may name the caller in a header; LAN callers are identified by their address.
+ExecStart=/usr/bin/python3 /home/efficient/office-llm-monitor/llm_monitor.py --host 127.0.0.1 --host 192.168.1.148 --port 8765 --db /home/efficient/qwen-monitor/monitor.db
 Restart=always
 RestartSec=10
 

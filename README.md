@@ -26,7 +26,7 @@ python3 llm_monitor.py --port 8765 --llm http://localhost:8080
 | flag | default | what it is |
 |---|---|---|
 | `--port` | 8765 | port to serve the page on |
-| `--host` | this machine's tailscale IPv4 | bind address; use `127.0.0.1` behind a proxy |
+| `--host` | this machine's tailscale IPv4 | bind address; repeat to listen on several (the first is primary; extra ones retry until their address exists) |
 | `--llm` | `http://<tailscale ip>:8080` | the llama-server to watch |
 | `--unit` | `llm.service` | the systemd unit whose journal is parsed |
 | `--page` | `monitor_page.html` | the page to serve |
