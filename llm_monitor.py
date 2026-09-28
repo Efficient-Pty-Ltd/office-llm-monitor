@@ -643,9 +643,16 @@ class H(BaseHTTPRequestHandler):
             return self.send(500, {'error': str(e)})
 
     def caller(self):
-        """Who is asking: the tailnet login when the call came through tailscale serve, else the peer address."""
+        """Who is asking: the tailnet login when the call came through tailscale serve, else the peer address.
+
+        Only tailscale serve may name the caller in a header: it connects from localhost and stamps the
+        login itself. A request that reached this port directly (the LAN, or the tailnet address) could
+        put any login in those headers, so it is identified by its peer address alone."""
+        peer = self.client_address[0] or '?'
+        if peer.startswith('::ffff:'): peer = peer[7:]
+        if peer not in ('127.0.0.1', '::1'): return peer
         return (self.headers.get('Tailscale-User-Login') or self.headers.get('X-Forwarded-For')
-                or self.client_address[0] or '?').split(',')[0].strip()
+                or peer).split(',')[0].strip()
 
     def do_POST(self):
         if urlparse(self.path).path == '/ask':
