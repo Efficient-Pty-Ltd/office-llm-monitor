@@ -10,8 +10,10 @@ User=efficient
 Group=efficient
 WorkingDirectory=/home/efficient/office-llm-monitor
 Environment=TZ=Australia/Sydney
-# 127.0.0.1 on purpose: the only way in is `tailscale serve`, which stamps who is calling.
-ExecStart=/usr/bin/python3 /home/efficient/office-llm-monitor/llm_monitor.py --host 127.0.0.1 --port 8765 --db /home/efficient/qwen-monitor/monitor.db
+# 0.0.0.0 so the office LAN can reach the page directly as well as through `tailscale serve`.
+# Only tailscale serve (connecting from localhost) may name the caller in a header; direct callers
+# are identified by their address, so the /ask allow-list cannot be claimed from the LAN.
+ExecStart=/usr/bin/python3 /home/efficient/office-llm-monitor/llm_monitor.py --host 0.0.0.0 --port 8765 --db /home/efficient/qwen-monitor/monitor.db
 Restart=always
 RestartSec=10
 
