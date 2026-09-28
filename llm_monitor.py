@@ -12,7 +12,7 @@ from urllib.parse import urlparse, parse_qs
 
 AP = argparse.ArgumentParser()
 AP.add_argument('--port', type=int, default=8765)
-AP.add_argument('--host', default='')            # default: this machine's tailscale IPv4
+AP.add_argument('--host', action='append', default=[])  # repeatable; the first is primary. default: tailscale IPv4
 AP.add_argument('--llm', default='')             # default: http://<tailscale ip>:8080
 AP.add_argument('--unit', default='llm.service')
 AP.add_argument('--page', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'monitor_page.html'))
@@ -31,7 +31,8 @@ if not TS_IP and not (ARGS.host and ARGS.llm):
     # reports the model down until someone restarts us. At boot we can start before tailscale has an
     # address; exiting lets systemd's Restart=always retry until it does.
     sys.exit('llm_monitor: no tailscale IPv4 yet; pass --host and --llm to run without tailscale')
-HOST = ARGS.host or TS_IP
+HOSTS = ARGS.host or [TS_IP]
+HOST = HOSTS[0]
 LLM = ARGS.llm or f'http://{TS_IP}:8080'
 LLM_PORT = int(urlparse(LLM).port or 8080)
 STARTED = time.time()
@@ -667,9 +668,24 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, ask_model(raw, sid, self.caller()), 'text/plain; charset=utf-8')
         return self.send(403, {'error': 'actions are not available on this server'})
 
+def serve_extra(host):
+    """Serve one more address (the LAN, say) without letting it take the primary one down. At boot the
+    interface may not hold its address yet, so a failed bind is retried rather than fatal."""
+    while True:
+        try:
+            server = ThreadingHTTPServer((host, ARGS.port), H)
+        except OSError as e:
+            print(f'llm_monitor: cannot listen on {host}:{ARGS.port} yet ({e}); retrying in 15 s', flush=True)
+            time.sleep(15)
+            continue
+        print(f'llm_monitor: also listening on http://{host}:{ARGS.port}', flush=True)
+        server.serve_forever()
+
 if __name__ == '__main__':
     boot_gap_check()
     for fn in (live_loop, gpu_loop, journal_loop):
         threading.Thread(target=fn, daemon=True).start()
+    for extra in HOSTS[1:]:
+        threading.Thread(target=serve_extra, args=(extra,), daemon=True).start()
     print(f'Efficient ERP Office LLM on http://{HOST}:{ARGS.port}  (model server {LLM})', flush=True)
     ThreadingHTTPServer((HOST, ARGS.port), H).serve_forever()
