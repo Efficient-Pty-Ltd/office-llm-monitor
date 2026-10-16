@@ -3925,7 +3925,7 @@ function v3Kpis(){if(!lastSeries)return;const st=lastSeries.stats,R=st.range,P=s
   $('v3span').textContent=lastTxt();document.querySelectorAll('#v3 .per').forEach(e=>{if(e.textContent!==lastTxt())e.textContent=lastTxt()})}
 function v3Log(){if(!lastSeries)return;const d=lastSeries,st=d.stats,now=d.now||Date.now()/1000,long=range!=='5m'&&range!=='1h';
   const names={};(d.by_client||[]).forEach(c=>names[c.ip]=c.name);(lastLive&&lastLive.clients||[]).forEach(c=>names[c.ip]=c.name);
-  const who=ip=>ip==='lmstudio-app'||!ip?'LLM Server':names[ip]||ip;
+  const who=ip=>ip==='lmstudio-app'?'LLM Server':!ip?'unknown':names[ip]||ip;
   const ev=[];
   (d.table||[]).forEach(r=>ev.push({t:r.t_end,k:'ok',who:who(r.client),txt:fmtN((r.prompt_tokens||0)+(r.gen_tokens||0))+' tokens'+(r.gen_tps?' · '+r.gen_tps.toFixed(1)+' t/s':''),r:fmtS(r.total_ms),
     tip:tipCard('',[
