@@ -6,7 +6,7 @@ Serves the monitor page and its JSON on the tailnet address only.
   request log : the llm.service journal (print_timing / release lines), kept in SQLite
 Standard library only.
 """
-import argparse, datetime as dt, json, os, re, sqlite3, subprocess, sys, threading, time, urllib.request
+import argparse, datetime as dt, hmac, json, os, re, sqlite3, subprocess, sys, threading, time, urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -17,6 +17,10 @@ AP.add_argument('--llm', default='')             # default: http://<tailscale ip
 AP.add_argument('--unit', default='llm.service')
 AP.add_argument('--page', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'monitor_page.html'))
 AP.add_argument('--db', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'monitor.db'))
+# llama-server's API key (its --api-key-file). systemd hands it to this unit as the credential
+# llm-api-key (LoadCredential, efficient-ops ansible/roles/llm), so the default is that file; with no
+# file the monitor runs as before, against a llama-server that has no key.
+AP.add_argument('--api-key-file', default=os.path.join(os.environ.get('CREDENTIALS_DIRECTORY', ''), 'llm-api-key'))
 ARGS = AP.parse_args()
 
 def sh(cmd, timeout=10):
@@ -35,6 +39,15 @@ HOSTS = ARGS.host or [TS_IP]
 HOST = HOSTS[0]
 LLM = ARGS.llm or f'http://{TS_IP}:8080'
 LLM_PORT = int(urlparse(LLM).port or 8080)
+
+def read_api_key(path):
+    """The first key in llama-server's key file (one per line, # for comments), or '' with no file."""
+    if not path or not os.path.isfile(path):
+        return ''
+    with open(path) as f:
+        return next((ln.strip() for ln in f if ln.strip() and not ln.startswith('#')), '')
+
+API_KEY = read_api_key(ARGS.api_key_file)
 STARTED = time.time()
 LOCK = threading.Lock()
 
@@ -65,13 +78,28 @@ def add_event(t, text):
         DB.execute('insert into events values(?,?)', (t, text)); DB.commit()
 
 # ---------------------------------------------------------------- helpers
+def llm_request(path, data=None, headers=None):
+    """A request to llama-server, carrying its API key when it has one: with a key set, llama-server
+    answers only /health without it, so /slots, /props and /metrics would read as the model down."""
+    h = dict(headers or {})
+    if API_KEY: h['Authorization'] = 'Bearer ' + API_KEY
+    return urllib.request.Request(LLM + path, data=data, headers=h)
+
 def get_json(path, timeout=3):
-    with urllib.request.urlopen(LLM + path, timeout=timeout) as r:
+    with urllib.request.urlopen(llm_request(path), timeout=timeout) as r:
         return json.loads(r.read())
 
 def get_text(path, timeout=3):
-    with urllib.request.urlopen(LLM + path, timeout=timeout) as r:
+    with urllib.request.urlopen(llm_request(path), timeout=timeout) as r:
         return r.read().decode()
+
+def key_ok(headers):
+    """Whether a caller presented llama-server's API key, as llama-server itself accepts it (a Bearer
+    Authorization or an X-Api-Key header). Always true when no key is set."""
+    if not API_KEY: return True
+    got = headers.get('Authorization') or ''
+    got = got[7:] if got.startswith('Bearer ') else (headers.get('X-Api-Key') or '')
+    return hmac.compare_digest(got.encode(), API_KEY.encode())
 
 NAMES = {'t': 0, 'map': {}}
 def peer_names():
@@ -428,8 +456,7 @@ def ask_model(q, sid='default', who=''):
                        'max_tokens': 400, 'temperature': 0.7,
                        'messages': [{'role': 'system', 'content': ASK_SYS}] + chat['msgs']}).encode()
     try:
-        rq = urllib.request.Request(LLM + '/v1/chat/completions', data=body,
-                                    headers={'Content-Type': 'application/json'})
+        rq = llm_request('/v1/chat/completions', data=body, headers={'Content-Type': 'application/json'})
         with urllib.request.urlopen(rq, timeout=120) as r:
             d = json.loads(r.read().decode())
         txt = (((d.get('choices') or [{}])[0].get('message') or {}).get('content') or '').strip()
@@ -599,6 +626,9 @@ class H(BaseHTTPRequestHandler):
             # with the OpenAI fields kept as well, so every client sees the model. Tailscale routes this
             # path here; everything else under /v1 goes straight to llama-server.
             if u.path in ('/v1/models', '/v1/models/'):
+                # Part of the model API, so it asks for the model's key like the rest of /v1 does.
+                if not key_ok(self.headers):
+                    return self.send(401, {'error': {'message': 'Invalid API Key', 'type': 'authentication_error', 'code': 401}})
                 mi = model_info()[0]; ident = mi['identifier'] or 'model'
                 made = int(STATE.get('loaded_at') or time.time())
                 iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(made))
