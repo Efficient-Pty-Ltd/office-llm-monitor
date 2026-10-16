@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """A stand-in for llama-server, so the monitor can be tested without a GPU.
 
-It answers the three endpoints the monitor actually reads: /health, /props and /slots.
+It answers the three endpoints the monitor actually reads: /health, /props and /slots. With
+FAKE_API_KEY set it refuses all but /health without that key, as llama-server does with --api-key.
 """
-import json, sys
+import json, os, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROPS = {'default_generation_settings': {'n_ctx': 131072, 'params': {'n_predict': -1}},
@@ -22,6 +23,9 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
     def do_GET(self):
+        key = os.environ.get('FAKE_API_KEY')
+        if key and self.path != '/health' and self.headers.get('Authorization') != 'Bearer ' + key:
+            self.send_response(401); self.end_headers(); return
         body = {'/health': {'status': 'ok'}, '/props': PROPS, '/slots': SLOTS}.get(self.path.split('?')[0])
         if body is None:
             self.send_response(404); self.end_headers(); return

@@ -19,8 +19,9 @@ def check(name, fn):
         fails.append(name); print('  FAIL %s -> %s' % (name, e))
 
 
-def get(path, want_json=True):
-    with urllib.request.urlopen('http://127.0.0.1:%d%s' % (MON_PORT, path), timeout=20) as r:
+def get(path, want_json=True, port=MON_PORT, headers=None):
+    rq = urllib.request.Request('http://127.0.0.1:%d%s' % (port, path), headers=headers or {})
+    with urllib.request.urlopen(rq, timeout=20) as r:
         body = r.read()
         assert r.status == 200, 'status %s' % r.status
         return json.loads(body) if want_json else body
@@ -36,6 +37,60 @@ def exits_without_tailnet():
                        env=dict(os.environ, PATH=empty), capture_output=True, text=True, timeout=20)
     assert r.returncode != 0, 'started without a tailscale address (exit %s)' % r.returncode
     assert 'no tailscale IPv4' in r.stderr, 'unexpected stderr: %r' % r.stderr[-200:]
+
+
+def start(fake_port, mon_port, db, env=None, extra=()):
+    fake = subprocess.Popen([sys.executable, os.path.join(HERE, 'fake_llama.py'), str(fake_port)],
+                            env=dict(os.environ, **(env or {})))
+    mon = subprocess.Popen([sys.executable, os.path.join(ROOT, 'llm_monitor.py'),
+                            '--host', '127.0.0.1', '--port', str(mon_port),
+                            '--llm', 'http://127.0.0.1:%d' % fake_port,
+                            '--db', db, '--unit', 'nonexistent.service', *extra])
+    for _ in range(60):                           # wait for it to come up
+        try:
+            urllib.request.urlopen('http://127.0.0.1:%d/live' % mon_port, timeout=2); break
+        except Exception:
+            time.sleep(0.5)
+    else:
+        raise SystemExit('monitor never started')
+    return fake, mon
+
+
+def status_of(port, path, headers=None):
+    try:
+        return get(path, port=port, headers=headers) and 200
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+def with_api_key():
+    # llama-server with --api-key answers only /health without the key: the monitor must send it on
+    # every read, or the page shows the model down while it serves, and /v1/models must ask for it.
+    key = 'smoke-test-key'
+    tmp = tempfile.mkdtemp()
+    key_file = os.path.join(tmp, 'llm-api-key')
+    with open(key_file, 'w') as f:
+        f.write('# llama-server key\n%s\n' % key)
+    fake, mon = start(FAKE_PORT + 1, MON_PORT + 1, os.path.join(tmp, 'k.db'),
+                      env={'FAKE_API_KEY': key}, extra=('--api-key-file', key_file))
+    try:
+        def slots_read():
+            for _ in range(20):                   # the live loop polls; give it a few rounds
+                if len(get('/live', port=MON_PORT + 1).get('slots') or []) == 4: return
+                time.sleep(0.5)
+            raise AssertionError('the monitor read no slots from a keyed llama-server')
+        check('reads a keyed llama-server', slots_read)
+        check('/v1/models refuses a caller without the key', lambda: (
+            status_of(MON_PORT + 1, '/v1/models') == 401 or (_ for _ in ()).throw(AssertionError('not 401'))))
+        check('/v1/models refuses a wrong key', lambda: (
+            status_of(MON_PORT + 1, '/v1/models', {'Authorization': 'Bearer nope'}) == 401
+            or (_ for _ in ()).throw(AssertionError('not 401'))))
+        check('/v1/models answers the key', lambda: (
+            status_of(MON_PORT + 1, '/v1/models', {'Authorization': 'Bearer ' + key}) == 200
+            or (_ for _ in ()).throw(AssertionError('not 200'))))
+    finally:
+        for p in (mon, fake):
+            p.send_signal(signal.SIGTERM); p.wait(timeout=10)
 
 
 def main():
@@ -75,6 +130,8 @@ def main():
         for p in (mon, fake):
             p.send_signal(signal.SIGTERM); p.wait(timeout=10)
         if os.path.exists(db): os.remove(db)
+
+    with_api_key()
 
     if fails:
         print('\n%d check(s) failed' % len(fails)); sys.exit(1)
