@@ -26,6 +26,9 @@ jobs:
       - name: Smoke test against a fake llama-server
         run: python tests/smoke.py
 
+      - name: Who asked (caller attribution and the /v1 proxy)
+        run: python tests/attribution.py
+
       - name: Warn about leftovers
         run: |
           if ls *.bak* 2>/dev/null | grep -q .; then

@@ -6,7 +6,7 @@ Serves the monitor page and its JSON on the tailnet address only.
   request log : the llm.service journal (print_timing / release lines), kept in SQLite
 Standard library only.
 """
-import argparse, datetime as dt, hmac, json, os, re, sqlite3, subprocess, sys, threading, time, urllib.request
+import argparse, datetime as dt, hmac, http.client, itertools, json, os, re, sqlite3, subprocess, sys, threading, time, urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -121,7 +121,11 @@ def name_of(ip):
     return peer_names().get(ip, ip)
 
 def established_peers():
-    """IPs with an open connection to the model server port, and how many each."""
+    """Direct callers: IPs with an open connection to the model server port, and how many each.
+
+    Our own address is left out. That is our polling of /slots and /metrics, but also every request
+    that came through tailscale serve and the /v1 proxy below, which reach llama-server from here:
+    those are known by name in PROXIED, not guessed from a socket."""
     out = sh(['ss', '-Htn', 'state', 'established', f'( sport = :{LLM_PORT} )'])
     c = {}
     for line in out.splitlines():
@@ -132,6 +136,79 @@ def established_peers():
             if peer in (TS_IP, '127.0.0.1', '::1'): continue     # our own polling of /slots and /metrics
             c[peer] = c.get(peer, 0) + 1
     return c
+
+# ---------------------------------------------------------------- who asked
+# Requests through tailscale serve reach llama-server from tailscaled on this box's own address, so a
+# socket cannot say whose they are. Serve's /v1 route points at our proxy instead (H.proxy), which reads
+# the caller from the headers serve stamps and notes each request here. llama-server tells us nothing
+# that ties an HTTP request to its task (and /v1/messages drops any field we could tag it with), so a
+# finished proxied request is matched to its journal row by when it ended and how many tokens it wrote,
+# which the response carries. Measured 2026-10-16: 529 of 998 requests had no caller, and serve
+# requests went to whichever peer held a keep-alive open.
+PROXIED = {'live': {}, 'done': []}   # live: rid -> {client, t0, task}; done: [{t, gen, client, failed, row}]
+PROXY_IDS = itertools.count(1)
+CLAIMED = set()                      # request rows a proxied request has already named
+MATCH_S = 5                          # how far apart a response's end and its journal line may be
+GEN_RX = re.compile(rb'"(?:predicted_n|output_tokens|completion_tokens)"\s*:\s*(\d+)')
+
+def generates(path):
+    """Whether a /v1 call runs a task on a slot (and so becomes a request row)."""
+    p = urlparse(path).path.rstrip('/')
+    return p.endswith(('/completions', '/messages', '/responses'))
+
+def gen_tokens_of(tail):
+    """Tokens written, from the end of a response: timings.predicted_n (OpenAI shapes) or
+    usage.output_tokens (Anthropic, streamed or not). None when the response says neither."""
+    m = None
+    for m in GEN_RX.finditer(tail): pass
+    return int(m.group(1)) if m else None
+
+def proxy_start(client):
+    with LOCK:
+        rid = next(PROXY_IDS)
+        PROXIED['live'][rid] = {'client': client, 't0': time.time(), 'task': None}
+    return rid
+
+def proxy_end(rid, status, gen, now=None):
+    """A proxied request finished: remember it, and name its row if the journal got there first."""
+    now = now or time.time()
+    with LOCK:
+        r = PROXIED['live'].pop(rid, None)
+        if not r: return
+        d = {'t': now, 'gen': gen, 'client': r['client'], 'failed': status >= 400, 'row': None}
+        PROXIED['done'] = [x for x in PROXIED['done'] if x['t'] > now - 600] + [d]
+        if d['failed'] or gen is None: return
+        rows = [rid_ for (rid_,) in DB.execute(
+            'select rowid from requests where t_end between ? and ? and gen_tokens=?',
+            (now - MATCH_S, now + MATCH_S, gen)) if rid_ not in CLAIMED]
+        if len(rows) == 1:
+            CLAIMED.add(rows[0]); d['row'] = rows[0]
+            DB.execute('update requests set client=? where rowid=?', (d['client'], rows[0])); DB.commit()
+
+def proxy_claim(t, gen):
+    """The caller of a request row ending at t with gen tokens written, if one proxied request
+    matches it and no other does. Call with LOCK held."""
+    hits = [d for d in PROXIED['done'] if d['row'] is None and not d['failed'] and d['gen'] is not None
+            and d['gen'] == gen and abs(d['t'] - t) <= MATCH_S]
+    return hits[0] if len(hits) == 1 else None
+
+def proxy_failure(t):
+    """The caller of a failure logged at t, when exactly one proxied request failed around then."""
+    hits = [d for d in PROXIED['done'] if d['failed'] and abs(d['t'] - t) <= MATCH_S]
+    return hits[0]['client'] if len(hits) == 1 else None
+
+def pick_caller(peers, busy, waiting):
+    """Who a task that just appeared on a slot belongs to, as (proxied rid or None, client or None).
+
+    peers: direct callers' open connections; busy: tasks already given to each; waiting: proxied
+    requests in flight that have no task yet, oldest first, as (rid, client). Only an answer with one
+    possible source is given. A direct caller's idle keep-alive used to win any request it could not
+    otherwise place, which put serve's requests on the wrong person; now that is no answer at all."""
+    direct = [ip for ip, n in peers.items() if n > busy.get(ip, 0)]
+    if direct and waiting: return None, None
+    if len(direct) == 1: return None, direct[0]
+    if waiting and len({c for _, c in waiting}) == 1: return waiting[0]
+    return None, None
 
 # ---------------------------------------------------------------- live sampler
 STATE = {'slots': {}, 'gpus': [], 'gpu_t': 0, 'sys': {}, 'lm_up': False, 'lm_since': None, 'down_since': None,
@@ -285,13 +362,16 @@ def live_loop():
                     SLOT_MEMO.pop(k, None)
                     out[k] = {'task': None, 'phase': 'idle', 'progress': None, 'since': None, 'read_tokens': 0,
                               'gen_tokens': 0, 'gen_tps': None, 'client': None}
-            # give each new request the connected client that has more open connections than known requests
+            # give each new request its caller, when only one could have sent it (pick_caller)
             for k, v in out.items():
-                if v['task'] is not None and not v['client']:
-                    cand = [ip for ip, n in peers.items() if n > busy_ips.get(ip, 0)] or list(peers)
-                    if cand:
-                        ip = cand[0]; v['client'] = ip; SLOT_MEMO[k]['client'] = ip
-                        busy_ips[ip] = busy_ips.get(ip, 0) + 1
+                if v['task'] is not None and not v['client'] and not SLOT_MEMO[k].get('asked'):
+                    SLOT_MEMO[k]['asked'] = True          # decided once, when the task first shows
+                    waiting = [(rid, r['client']) for rid, r in sorted(PROXIED['live'].items()) if r['task'] is None]
+                    rid, ip = pick_caller(peers, busy_ips, waiting)
+                    if rid: PROXIED['live'][rid]['task'] = v['task']
+                    if ip:
+                        v['client'] = ip; SLOT_MEMO[k]['client'] = ip
+                        if not rid: busy_ips[ip] = busy_ips.get(ip, 0) + 1
                 if v['task'] is not None and v['client']:
                     TASK_CLIENT[v['task']] = v['client']
             if len(TASK_CLIENT) > 2000:
@@ -342,12 +422,15 @@ def handle_line(t, msg, ident):
     if m:
         task = int(m.group(2)); p = PENDING.pop(task, {'slot': int(m.group(1))})
         if 'total_ms' not in p: return            # cancelled before any timing: not a finished request
-        client = TASK_CLIENT.get(task)
         with LOCK:
-            DB.execute('insert into requests values(?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                       (t, task, p['slot'], p.get('prompt_tokens', 0), p.get('prompt_ms', 0), p.get('prompt_tps', 0),
-                        p.get('gen_tokens', 0), p.get('gen_ms', 0), p.get('gen_tps', 0), p.get('total_ms', 0),
-                        p.get('draft_acc'), int(m.group(3)), client))
+            # a proxied request that ended with this one names it; else the live guess, if it had one
+            d = proxy_claim(t, p.get('gen_tokens', 0))
+            client = d['client'] if d else TASK_CLIENT.get(task)
+            cur = DB.execute('insert into requests values(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                             (t, task, p['slot'], p.get('prompt_tokens', 0), p.get('prompt_ms', 0), p.get('prompt_tps', 0),
+                              p.get('gen_tokens', 0), p.get('gen_ms', 0), p.get('gen_tps', 0), p.get('total_ms', 0),
+                              p.get('draft_acc'), int(m.group(3)), client))
+            if d: d['row'] = cur.lastrowid; CLAIMED.add(cur.lastrowid)
             DB.commit()
         return
     m = RX_ERR.search(msg)
@@ -361,8 +444,9 @@ def handle_line(t, msg, ident):
         text = (why.group(1).strip() if why else
                 next((l.strip() for l in text.splitlines() if l.strip() and not l.startswith('---')), text))[:300]
         busy = [v for v in STATE['slots'].values() if v.get('client')]
-        client = busy[0]['client'] if len(busy) == 1 else (next(iter(established_peers()), None))
         with LOCK:
+            # no guessing from whoever holds a connection: that named the wrong person
+            client = proxy_failure(t) or (busy[0]['client'] if len(busy) == 1 else None)
             DB.execute('insert into failures values(?,?,?,?)', (t, None, client, text)); DB.commit()
 
 def journal_loop():
@@ -455,12 +539,16 @@ def ask_model(q, sid='default', who=''):
     body = json.dumps({'model': (model_info()[0]['identifier'] or 'model'), 'reasoning_effort': 'low',
                        'max_tokens': 400, 'temperature': 0.7,
                        'messages': [{'role': 'system', 'content': ASK_SYS}] + chat['msgs']}).encode()
+    rid = proxy_start(who or '?')             # our own call, made for this caller: name its row after them
     try:
         rq = llm_request('/v1/chat/completions', data=body, headers={'Content-Type': 'application/json'})
         with urllib.request.urlopen(rq, timeout=120) as r:
-            d = json.loads(r.read().decode())
+            raw = r.read()
+        d = json.loads(raw.decode())
+        proxy_end(rid, 200, gen_tokens_of(raw))
         txt = (((d.get('choices') or [{}])[0].get('message') or {}).get('content') or '').strip()
     except Exception as e:
+        proxy_end(rid, 500, None)
         chat['msgs'].pop()
         return 'The model did not answer: %s' % e
     chat['msgs'].append({'role': 'assistant', 'content': txt})
@@ -623,8 +711,8 @@ class H(BaseHTTPRequestHandler):
                     ct = {'png': 'image/png', 'svg': 'image/svg+xml', 'ico': 'image/x-icon', 'webmanifest': 'application/manifest+json'}[u.path.rsplit('.', 1)[1]]
                     return self.send(200, open(f, 'rb').read(), ct, {'Cache-Control': 'max-age=3600'})
             # /v1/models in the shape Claude Code's model discovery wants (Anthropic: type + display_name),
-            # with the OpenAI fields kept as well, so every client sees the model. Tailscale routes this
-            # path here; everything else under /v1 goes straight to llama-server.
+            # with the OpenAI fields kept as well, so every client sees the model. The rest of /v1 is
+            # passed on to llama-server by self.proxy, below.
             if u.path in ('/v1/models', '/v1/models/'):
                 # Part of the model API, so it asks for the model's key like the rest of /v1 does.
                 if not key_ok(self.headers):
@@ -640,6 +728,7 @@ class H(BaseHTTPRequestHandler):
                 rows = [row('claude-' + ident, (mi['displayName'] or ident) + ' (office)'), row(ident, mi['displayName'] or ident)]
                 return self.send(200, {'data': rows, 'object': 'list', 'has_more': False,
                                        'first_id': rows[0]['id'], 'last_id': rows[-1]['id']})
+            if u.path.startswith('/v1/'): return self.proxy('GET')
             # /ask?q=... : plain text in, plain text out. It exists so an iPhone shortcut can be
             # three steps (dictate -> fetch -> speak) with no JSON to unpack.
             if u.path == '/ask':
@@ -685,7 +774,66 @@ class H(BaseHTTPRequestHandler):
         return (self.headers.get('Tailscale-User-Login') or self.headers.get('X-Forwarded-For')
                 or peer).split(',')[0].strip()
 
+    # Not passed on: hop-by-hop headers, Host (ours is not llama-server's), and Accept-Encoding, so the
+    # answer comes back plain and its token count can be read off the end. Content-Length is set anew.
+    HOP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'trailers',
+           'transfer-encoding', 'upgrade', 'host', 'accept-encoding', 'content-length'}
+
+    def read_body(self):
+        if (self.headers.get('Transfer-Encoding') or '').lower() == 'chunked':
+            out = b''
+            while True:
+                n = int(self.rfile.readline().split(b';')[0].strip() or b'0', 16)
+                if not n:
+                    while self.rfile.readline().strip(): pass     # trailers, then the blank line
+                    return out
+                out += self.rfile.read(n); self.rfile.readline()
+        n = int(self.headers.get('Content-Length') or 0)
+        return self.rfile.read(n) if n else b''
+
+    def proxy(self, method):
+        """/v1 for tailscale serve: pass the call to llama-server as it came, and note who made it.
+
+        Serve's /v1 route ends here rather than at llama-server so the caller is known (see PROXIED).
+        The caller's own key goes through untouched and llama-server judges it; we refuse a wrong one
+        first only so a stranger's call never reaches a slot."""
+        if not key_ok(self.headers):
+            return self.send(401, {'error': {'message': 'Invalid API Key', 'type': 'authentication_error', 'code': 401}})
+        body = self.read_body() if method == 'POST' else None
+        hdrs = {k: v for k, v in self.headers.items() if k.lower() not in self.HOP}
+        if body is not None: hdrs['Content-Length'] = str(len(body))
+        rid = proxy_start(self.caller()) if method == 'POST' and generates(self.path) else None
+        lu = urlparse(LLM)
+        conn = http.client.HTTPConnection(lu.hostname, lu.port or 80, timeout=1800)
+        status, gen, started = 502, None, False
+        try:
+            conn.request(method, self.path, body=body, headers=hdrs)
+            r = conn.getresponse()
+            status = r.status
+            self.send_response(r.status)
+            for k, v in r.getheaders():
+                if k.lower() not in self.HOP - {'content-length'} and k.lower() not in ('server', 'date'):
+                    self.send_header(k, v)
+            self.end_headers(); started = True
+            tail = b''
+            while True:                          # stream it on as it comes: answers are server-sent events
+                chunk = r.read1(65536)
+                if not chunk: break
+                self.wfile.write(chunk); self.wfile.flush()
+                tail = (tail + chunk)[-16384:]
+            gen = gen_tokens_of(tail)
+        except (BrokenPipeError, ConnectionResetError):
+            status = 499                         # the caller went away; closing ours cancels the task
+        except OSError as e:
+            if not started:
+                self.send(502, {'error': {'message': 'model server unreachable: %s' % e, 'type': 'server_error', 'code': 502}})
+        finally:
+            conn.close()
+            if rid: proxy_end(rid, status, gen)
+        self.close_connection = True
+
     def do_POST(self):
+        if urlparse(self.path).path.startswith('/v1/'): return self.proxy('POST')
         if urlparse(self.path).path == '/ask':
             n = int(self.headers.get('Content-Length') or 0)
             raw = self.rfile.read(n).decode('utf-8', 'replace').strip() if n else ''

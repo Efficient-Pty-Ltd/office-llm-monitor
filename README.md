@@ -39,6 +39,16 @@ not listen.
 Nothing about a conversation is stored: the database holds token counts, timings and the
 caller's name, never a prompt or an answer.
 
+## Who asked
+
+A direct caller (`http://<tailscale ip>:8080`) is named from its open connection to llama-server,
+and only when no one else could have sent that request. A caller through tailscale serve
+(`https://<host>/v1`) cannot be told apart that way: serve reaches llama-server from this box's own
+address. So serve's `/v1` route points at the monitor, which passes each call on to llama-server
+unchanged, reads who made it from the headers serve stamps, and names the request's row by when it
+ended and how many tokens it wrote. A request no one can be sure of shows as "unknown". The route
+itself lives in efficient-ops (`ansible/inventory/group_vars/llm.yml`, Tailscale Serve).
+
 ## Files
 
 | path | what |
@@ -69,5 +79,5 @@ rest of the stylesheet, a `<script>` that never closes, an icon referenced but m
 Run the same checks locally before pushing:
 
 ```bash
-python3 -m compileall -q llm_monitor.py && python3 tests/smoke.py
+python3 -m compileall -q llm_monitor.py && python3 tests/smoke.py && python3 tests/attribution.py
 ```
