@@ -41,13 +41,16 @@ caller's name, never a prompt or an answer.
 
 ## Who asked
 
-A direct caller (`http://<tailscale ip>:8080`) is named from its open connection to llama-server,
-and only when no one else could have sent that request. A caller through tailscale serve
-(`https://<host>/v1`) cannot be told apart that way: serve reaches llama-server from this box's own
-address. So serve's `/v1` route points at the monitor, which passes each call on to llama-server
-unchanged, reads who made it from the headers serve stamps, and names the request's row by when it
-ended and how many tokens it wrote. A request no one can be sure of shows as "unknown". The route
-itself lives in efficient-ops (`ansible/inventory/group_vars/llm.yml`, Tailscale Serve).
+Every call to the model comes through tailscale serve (`https://<host>/v1`) and this monitor:
+llama-server listens on 127.0.0.1 only (efficient-ops `llm_bind`), and serve's `/v1` route points
+here (`ansible/inventory/group_vars/llm.yml`, Tailscale Serve). The monitor passes each call on to
+llama-server unchanged, reads who made it from the headers serve stamps (the person's login, or a
+tagged device's address), and names the request's row by when it ended and how many tokens it wrote.
+A call serve did not name, such as one from the LAN, is refused with 403. The monitor finds
+llama-server from its own `--host`/`--port`, so it follows a move. A row can still read "unknown"
+when two named requests end together with the same token count, or for a llama-server still on
+its tailnet address, where a direct caller is named from its open connection only when nobody else
+could have sent the request.
 
 ## Files
 

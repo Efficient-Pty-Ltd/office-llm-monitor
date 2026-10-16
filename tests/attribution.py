@@ -138,8 +138,9 @@ def end_to_end():
         except Exception:
             time.sleep(0.25)
 
-    def post(path, auth, body=b'{}'):
-        h = {'Content-Type': 'application/json', 'Tailscale-User-Login': HENRY, 'X-Forwarded-For': MAC}
+    def post(path, auth, body=b'{}', serve=True):
+        h = {'Content-Type': 'application/json'}
+        if serve: h.update({'Tailscale-User-Login': HENRY, 'X-Forwarded-For': MAC})
         if auth: h['Authorization'] = auth
         try:
             with urllib.request.urlopen(urllib.request.Request(base + path, data=body, headers=h), timeout=10) as r:
@@ -170,6 +171,20 @@ def end_to_end():
             eq(post('/v1/chat/completions', auth)[0], 401)
             eq(M.PROXIED['done'], [])                                        # never reached a slot
 
+        def unnamed():
+            # with the key but not through serve: no caller to name, so it never runs
+            reset()
+            eq(post('/v1/chat/completions', 'Bearer ' + key, serve=False)[0], 403)
+            eq(M.PROXIED['done'], [])
+
+        def device_only():
+            # a tagged device (the production backend) has no login, only its address
+            reset()
+            h = {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key, 'X-Forwarded-For': '100.74.7.82'}
+            with urllib.request.urlopen(urllib.request.Request(base + '/v1/chat/completions', data=b'{}', headers=h), timeout=10) as r:
+                eq(r.status, 200)
+            eq(last_done(), ('100.74.7.82', 7, False))
+
         def models():
             rq = urllib.request.Request(base + '/v1/models', headers={'Authorization': 'Bearer ' + key})
             eq(json.loads(urllib.request.urlopen(rq, timeout=5).read())['object'], 'list')
@@ -178,9 +193,27 @@ def end_to_end():
         check('/v1 proxy streams an answer through and notes who asked', stream)
         check('/v1 proxy refuses no key', lambda: refused(None))
         check('/v1 proxy refuses a wrong key', lambda: refused('Bearer nope'))
+        check('/v1 proxy refuses a keyed call serve did not name', unnamed)
+        check('/v1 proxy names a tagged device by its address', device_only)
         check('/v1/models is still answered by the monitor', models)
     finally:
         srv.shutdown(); fake.send_signal(signal.SIGTERM); fake.wait(timeout=10)
+
+
+def finds_llama_server():
+    # llama-server moved to 127.0.0.1 so only serve and this monitor reach it; the monitor follows
+    # whatever --host/--port it was started with, and the tailnet address when it is not running
+    real = M.read_cmdline
+    try:
+        M.read_cmdline = lambda: ['/x/llama-server', '--model', 'm.gguf', '--host', '127.0.0.1', '--port', '8080']
+        eq(M.find_llm(), 'http://127.0.0.1:8080')
+        M.read_cmdline = lambda: ['/x/llama-server', '--host', '100.111.183.77', '--port', '9090']
+        eq(M.find_llm(), 'http://100.111.183.77:9090')
+        M.read_cmdline = lambda: []
+        M.TS_IP = '100.111.183.77'
+        eq(M.find_llm(), 'http://100.111.183.77:8080')
+    finally:
+        M.read_cmdline = real
 
 
 if __name__ == '__main__':
@@ -191,6 +224,7 @@ if __name__ == '__main__':
     check('a request nobody can claim records no caller', no_caller_stays_empty)
     check('two proxied requests that could own a row claim neither', ambiguous_left_alone)
     check('tokens written are read off the end of each answer shape', tokens_read_off_the_end)
+    check('the monitor finds llama-server where it was started', finds_llama_server)
     end_to_end()
     if fails:
         print('\n%d check(s) failed' % len(fails)); sys.exit(1)

@@ -37,7 +37,7 @@ if not TS_IP and not (ARGS.host and ARGS.llm):
     sys.exit('llm_monitor: no tailscale IPv4 yet; pass --host and --llm to run without tailscale')
 HOSTS = ARGS.host or [TS_IP]
 HOST = HOSTS[0]
-LLM = ARGS.llm or f'http://{TS_IP}:8080'
+LLM = ARGS.llm or f'http://{TS_IP}:8080'       # until find_llm() reads where llama-server really is
 LLM_PORT = int(urlparse(LLM).port or 8080)
 
 def read_api_key(path):
@@ -230,6 +230,15 @@ def read_cmdline():
             return [x.decode() for x in a if x]
     return []
 
+def find_llm():
+    """Where llama-server listens, from its own --host and --port; the tailnet address when it is not
+    running. It moved from the tailnet address to 127.0.0.1 on 2026-10-16 so that every call comes
+    through tailscale serve and this monitor, which name the caller (efficient-ops llm_bind)."""
+    cmd = read_cmdline()
+    opt = lambda n, d: cmd[cmd.index(n) + 1] if n in cmd and cmd.index(n) + 1 < len(cmd) else d
+    host = opt('--host', '') or TS_IP
+    return f'http://{"[%s]" % host if ":" in host else host}:{opt("--port", "8080")}'
+
 def unit_since():
     out = sh(['systemctl', 'show', ARGS.unit, '-p', 'ActiveEnterTimestamp', '-p', 'ActiveState', '--timestamp=unix'])
     m = re.search(r'ActiveEnterTimestamp=@(\d+)', out)
@@ -296,6 +305,7 @@ def gpu_loop():
         time.sleep(2)
 
 def live_loop():
+    global LLM, LLM_PORT
     fails = 0
     while True:
         now = time.time()
@@ -330,6 +340,8 @@ def live_loop():
                     STATE['loaded_at'] = STATE['lm_since']
             else:
                 fails += 1
+                if not ARGS.llm and fails % 3 == 0:     # restarted on another address?
+                    LLM = find_llm(); LLM_PORT = int(urlparse(LLM).port or 8080)
                 if fails >= 3 and STATE['lm_up']:
                     STATE['lm_up'] = False; STATE['down_since'] = now - 3; STATE['lm_since'] = now - 3
                 elif fails >= 3 and not STATE['down_since']:
@@ -796,13 +808,19 @@ class H(BaseHTTPRequestHandler):
 
         Serve's /v1 route ends here rather than at llama-server so the caller is known (see PROXIED).
         The caller's own key goes through untouched and llama-server judges it; we refuse a wrong one
-        first only so a stranger's call never reaches a slot."""
+        first only so a stranger's call never reaches a slot. A call serve did not name (the LAN, or
+        anything else that reached this port) is refused: no request runs without a known caller."""
         if not key_ok(self.headers):
             return self.send(401, {'error': {'message': 'Invalid API Key', 'type': 'authentication_error', 'code': 401}})
+        who = self.serve_caller()
+        if not who:
+            return self.send(403, {'error': {'message': 'The model API answers only through tailscale serve '
+                                             '(https://<this box>.ts.net/v1), which names the caller.',
+                                             'type': 'permission_error', 'code': 403}})
         body = self.read_body() if method == 'POST' else None
         hdrs = {k: v for k, v in self.headers.items() if k.lower() not in self.HOP}
         if body is not None: hdrs['Content-Length'] = str(len(body))
-        rid = proxy_start(self.caller()) if method == 'POST' and generates(self.path) else None
+        rid = proxy_start(who) if method == 'POST' and generates(self.path) else None
         lu = urlparse(LLM)
         conn = http.client.HTTPConnection(lu.hostname, lu.port or 80, timeout=1800)
         status, gen, started = 502, None, False
@@ -832,6 +850,13 @@ class H(BaseHTTPRequestHandler):
             if rid: proxy_end(rid, status, gen)
         self.close_connection = True
 
+    def serve_caller(self):
+        """The caller tailscale serve named, or '' when this call did not come through serve: serve
+        connects from localhost and always stamps X-Forwarded-For (and the login, for a person's device)."""
+        peer = (self.client_address[0] or '').removeprefix('::ffff:')
+        if peer not in ('127.0.0.1', '::1'): return ''
+        return (self.headers.get('Tailscale-User-Login') or self.headers.get('X-Forwarded-For') or '').split(',')[0].strip()
+
     def do_POST(self):
         if urlparse(self.path).path.startswith('/v1/'): return self.proxy('POST')
         if urlparse(self.path).path == '/ask':
@@ -860,6 +885,8 @@ def serve_extra(host):
         server.serve_forever()
 
 if __name__ == '__main__':
+    if not ARGS.llm:
+        LLM = find_llm(); LLM_PORT = int(urlparse(LLM).port or 8080)
     boot_gap_check()
     for fn in (live_loop, gpu_loop, journal_loop):
         threading.Thread(target=fn, daemon=True).start()
