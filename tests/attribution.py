@@ -149,6 +149,11 @@ def end_to_end():
             return e.code, None, b''
 
     def last_done():
+        # the proxy notes a request after the last byte is sent, so a client holding a full
+        # Content-Length answer can get here first
+        for _ in range(40):
+            if M.PROXIED['done']: break
+            time.sleep(0.05)
         d = M.PROXIED['done'][-1]
         return d['client'], d['gen'], d['failed']
 
