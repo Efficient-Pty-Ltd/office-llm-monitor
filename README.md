@@ -52,6 +52,21 @@ when two named requests end together with the same token count, or for a llama-s
 its tailnet address, where a direct caller is named from its open connection only when nobody else
 could have sent the request.
 
+## What the console gets
+
+Since 2026-10-21 Server Status shows this box's model server on the LLM server's **LLM** tab, and
+this page is on its way out. The box's metrics agent (efficient-backend `ops/ci-runner-metrics`,
+1.9.0) reads llama-server itself and asks this monitor for every call and model-server event since
+the last ones it sent:
+
+```
+GET http://127.0.0.1:8765/agent/log?after_request=<id>&after_event=<id>&limit=500
+```
+
+It answers a process on this box only (loopback, with no header tailscale serve stamps). A call is
+a row whether it was answered, failed, or refused by the /v1 proxy for having no caller (`status`),
+and a row is held back until its caller can no longer change. Nothing about a conversation is in it.
+
 ## Files
 
 | path | what |
