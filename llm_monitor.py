@@ -64,7 +64,13 @@ create table if not exists outages(t_from real, t_to real, kind text);
 create table if not exists events(t real, text text);
 create table if not exists meta(k text primary key, v text);
 ''')
+# Since 2026-10-21 a row is also a call that failed or that the /v1 proxy refused, so the metrics
+# agent can send every call to the console (GET /agent/log). The page counts the answered ones only.
+for col, decl in (('status', "text default 'ok'"), ('error', 'text')):
+    if col not in [r[1] for r in DB.execute('pragma table_info(requests)')]:
+        DB.execute(f'alter table requests add column {col} {decl}')
 DB.commit()
+ANSWERED = "coalesce(status, 'ok') = 'ok'"
 
 def meta_get(k, d=None):
     r = DB.execute('select v from meta where k=?', (k,)).fetchone()
@@ -179,7 +185,7 @@ def proxy_end(rid, status, gen, now=None):
         PROXIED['done'] = [x for x in PROXIED['done'] if x['t'] > now - 600] + [d]
         if d['failed'] or gen is None: return
         rows = [rid_ for (rid_,) in DB.execute(
-            'select rowid from requests where t_end between ? and ? and gen_tokens=?',
+            f'select rowid from requests where t_end between ? and ? and gen_tokens=? and {ANSWERED}',
             (now - MATCH_S, now + MATCH_S, gen)) if rid_ not in CLAIMED]
         if len(rows) == 1:
             CLAIMED.add(rows[0]); d['row'] = rows[0]
@@ -438,7 +444,8 @@ def handle_line(t, msg, ident):
             # a proxied request that ended with this one names it; else the live guess, if it had one
             d = proxy_claim(t, p.get('gen_tokens', 0))
             client = d['client'] if d else TASK_CLIENT.get(task)
-            cur = DB.execute('insert into requests values(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            cur = DB.execute('insert into requests(t_end, task, slot, prompt_tokens, prompt_ms, prompt_tps, gen_tokens, '
+                             'gen_ms, gen_tps, total_ms, draft_acc, ctx_tokens, client) values(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                              (t, task, p['slot'], p.get('prompt_tokens', 0), p.get('prompt_ms', 0), p.get('prompt_tps', 0),
                               p.get('gen_tokens', 0), p.get('gen_ms', 0), p.get('gen_tps', 0), p.get('total_ms', 0),
                               p.get('draft_acc'), int(m.group(3)), client))
@@ -459,7 +466,10 @@ def handle_line(t, msg, ident):
         with LOCK:
             # no guessing from whoever holds a connection: that named the wrong person
             client = proxy_failure(t) or (busy[0]['client'] if len(busy) == 1 else None)
-            DB.execute('insert into failures values(?,?,?,?)', (t, None, client, text)); DB.commit()
+            DB.execute('insert into failures values(?,?,?,?)', (t, None, client, text))
+            DB.execute("insert into requests(t_end, slot, prompt_tokens, prompt_ms, gen_tokens, gen_ms, client, status, error) "
+                       "values(?, null, 0, 0, 0, 0, ?, 'failed', ?)", (t, client, text))
+            DB.commit()
 
 def journal_loop():
     # Poll rather than follow: "journalctl -f" skips entries from earlier boots, which lost requests made before a reboot.
@@ -587,7 +597,7 @@ def span_of(rng, now):
 
 def agg(a, b):
     r = DB.execute('select count(*), coalesce(sum(prompt_tokens),0), coalesce(sum(gen_tokens),0), coalesce(sum(gen_ms),0) '
-                   'from requests where t_end>=? and t_end<?', (a, b)).fetchone()
+                   f'from requests where t_end>=? and t_end<? and {ANSWERED}', (a, b)).fetchone()
     return {'requests': r[0], 'prompt': r[1], 'answer': r[2], 'answer_tps': round(r[2] / (r[3] / 1000), 1) if r[3] else 0}
 
 def local_midnight(now):
@@ -623,7 +633,7 @@ def series(rng):
         pts = []
         for t, n, pr, an, gms, pms in DB.execute(
                 'select cast(t_end/? as int)*?, count(*), sum(prompt_tokens), sum(gen_tokens), sum(gen_ms), sum(prompt_ms) '
-                'from requests where t_end>=? group by 1 order by 1', (rb, rb, a)):
+                f'from requests where t_end>=? and {ANSWERED} group by 1 order by 1', (rb, rb, a)):
             pts.append({'t': t, 'n': n, 'prompt': pr, 'answer': an, 'answer_tps': round(an / (gms / 1000), 1) if gms else 0,
                         'read_tps': round(pr / (pms / 1000)) if pms else 0})
         first = DB.execute('select min(t) from (select min(t_end) t from requests union select min(t) from gpu)').fetchone()[0]
@@ -640,9 +650,9 @@ def series(rng):
         cols = ['t_end', 'task', 'slot', 'prompt_tokens', 'prompt_ms', 'prompt_tps', 'gen_tokens', 'gen_ms', 'gen_tps',
                 'total_ms', 'draft_acc', 'ctx_tokens', 'client']
         table = [dict(zip(cols, r)) for r in DB.execute(
-            'select * from requests where t_end>=? order by t_end desc limit 1000', (a,))]
+            f'select {", ".join(cols)} from requests where t_end>=? and {ANSWERED} order by t_end desc limit 1000', (a,))]
         bc = [{'ip': c, 'name': name_of(c) or 'unknown', 'requests': n, 'prompt': p, 'answer': an} for c, n, p, an in DB.execute(
-            'select client, count(*), sum(prompt_tokens), sum(gen_tokens) from requests where t_end>=? group by client '
+            f'select client, count(*), sum(prompt_tokens), sum(gen_tokens) from requests where t_end>=? and {ANSWERED} group by client '
             'order by sum(prompt_tokens)+sum(gen_tokens) desc', (a,))]
         return {'now': now, 'gpu': gpu, 'gpu_bucket': gb, 'requests': {'bucket': rb, 'points': pts}, 'stats': stats,
                 'table': table, 'by_client': bc, 'span': span}
@@ -690,6 +700,35 @@ def log_days():
             out.append({'name': d.isoformat() + '.log', 'size': len(n.encode())})
         d -= dt.timedelta(days=1)
     return out
+
+# ---------------------------------------------------------------- the metrics agent's feed
+AGENT_LOG_KEEP = 30 * 86400    # what the console keeps; older rows are not worth sending
+AGENT_LOG_SETTLE = MATCH_S + 2 # a row's caller can still be named this long after it ends (proxy_end)
+
+def agent_log(after_request=0, after_event=0, limit=500, now=None):
+    """Every call and model-server event since the given ids, oldest first, for the box's metrics agent
+    (efficient-backend ops/ci-runner-metrics, 1.9.0), which sends them to Server Status with its reading.
+
+    A row is held back until its caller can no longer change. The ids are the rows' own, so the agent
+    asks again from the last one it got and a resend is the same rows; last_request and last_event are
+    where it asks from next, unchanged when nothing new came."""
+    now = now or time.time()
+    limit = max(1, min(int(limit), 1000))
+    with LOCK:
+        rows = DB.execute(
+            'select rowid, t_end, slot, prompt_tokens, prompt_ms, gen_tokens, gen_ms, client, status, error '
+            'from requests where rowid > ? and t_end > ? and t_end < ? order by rowid limit ?',
+            (after_request, now - AGENT_LOG_KEEP, now - AGENT_LOG_SETTLE, limit)).fetchall()
+        events = DB.execute('select rowid, t, text from events where rowid > ? and t > ? order by rowid limit ?',
+                            (after_event, now - AGENT_LOG_KEEP, limit)).fetchall()
+    requests = [{'id': rid, 'ended_at': t, 'caller': name_of(client) if client else '', 'status': status or 'ok',
+                 'slot': slot, 'prompt_tokens': p or 0, 'prompt_ms': pms or 0, 'gen_tokens': g or 0,
+                 'gen_ms': gms or 0, 'error': (error or '')[:300]}
+                for rid, t, slot, p, pms, g, gms, client, status, error in rows]
+    return {'requests': requests,
+            'events': [{'id': eid, 'at': t, 'text': text} for eid, t, text in events],
+            'last_request': requests[-1]['id'] if requests else after_request,
+            'last_event': events[-1][0] if events else after_event}
 
 # ---------------------------------------------------------------- http
 class H(BaseHTTPRequestHandler):
@@ -749,6 +788,12 @@ class H(BaseHTTPRequestHandler):
                 if not q: return self.send(400, 'ask me something', 'text/plain; charset=utf-8')
                 if not ask_ok(self.caller()): return self.send(403, 'not for you', 'text/plain; charset=utf-8')
                 return self.send(200, ask_model(q, sid, self.caller()), 'text/plain; charset=utf-8')
+            if u.path == '/agent/log':
+                # The metrics agent on this box only: loopback with no header tailscale serve stamps,
+                # so nothing that came in through serve (or the LAN) can read who asked.
+                if not self.local_only(): return self.send(403, {'error': 'this box only'})
+                return self.send(200, agent_log(int(q.get('after_request') or 0), int(q.get('after_event') or 0),
+                                                int(q.get('limit') or 500)))
             if u.path == '/live': return self.send(200, live())
             if u.path == '/series': return self.send(200, series(q.get('range', '1h')))
             if u.path == '/logs': return self.send(200, log_days())
@@ -773,6 +818,12 @@ class H(BaseHTTPRequestHandler):
             return self.send(404, {'error': 'not found'})
         except Exception as e:
             return self.send(500, {'error': str(e)})
+
+    def local_only(self):
+        """Whether this call came from a process on this box itself, not through tailscale serve."""
+        peer = (self.client_address[0] or '').removeprefix('::ffff:')
+        return peer in ('127.0.0.1', '::1') and not (
+            self.headers.get('X-Forwarded-For') or self.headers.get('Tailscale-User-Login'))
 
     def caller(self):
         """Who is asking: the tailnet login when the call came through tailscale serve, else the peer address.
@@ -814,6 +865,11 @@ class H(BaseHTTPRequestHandler):
             return self.send(401, {'error': {'message': 'Invalid API Key', 'type': 'authentication_error', 'code': 401}})
         who = self.serve_caller()
         if not who:
+            if method == 'POST' and generates(self.path):
+                peer = (self.client_address[0] or '?').removeprefix('::ffff:')
+                with LOCK:
+                    DB.execute("insert into requests(t_end, slot, prompt_tokens, prompt_ms, gen_tokens, gen_ms, client, status) "
+                               "values(?, null, 0, 0, 0, 0, ?, 'refused')", (time.time(), peer)); DB.commit()
             return self.send(403, {'error': {'message': 'The model API answers only through tailscale serve '
                                              '(https://<this box>.ts.net/v1), which names the caller.',
                                              'type': 'permission_error', 'code': 403}})

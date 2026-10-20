@@ -120,6 +120,47 @@ def tokens_read_off_the_end():
        [True, True, True, True, False, False])
 
 
+# ------------------------------------------------------------------ the metrics agent's feed
+def agent_log_feed():
+    # every call goes to the console through the box's metrics agent: answered, failed and refused
+    # alike, each once (the agent asks from the last id it got), and only once its caller is settled
+    reset(); M.DB.execute('delete from requests'); M.DB.execute('delete from events'); M.DB.commit()
+    t = time.time() - 60
+    rid = M.proxy_start(HENRY); M.proxy_end(rid, 200, 30, now=t)
+    finish(t, 1, 601, 30)
+    M.handle_line(t + 1, 'got exception: {"error": {"message": "context too long"}}', 'llama-server')
+    M.DB.execute("insert into requests(t_end, prompt_tokens, prompt_ms, gen_tokens, gen_ms, client, status) "
+                 "values(?, 0, 0, 0, 0, '192.168.1.20', 'refused')", (t + 2,))
+    M.DB.execute("insert into requests(t_end, prompt_tokens, prompt_ms, gen_tokens, gen_ms, client) "
+                 "values(?, 5, 1, 5, 1, ?)", (time.time(), HENRY))                     # not settled yet
+    M.DB.execute("insert into requests(t_end, prompt_tokens, prompt_ms, gen_tokens, gen_ms, client) "
+                 "values(?, 5, 1, 5, 1, ?)", (time.time() - 40 * 86400, HENRY))        # past what is kept
+    M.add_event(t, 'model server started')
+    M.DB.commit()
+    log = M.agent_log()
+    eq([(r['caller'], r['status'], r['gen_tokens']) for r in log['requests']],
+       [(HENRY, 'ok', 30), ('', 'failed', 0), ('192.168.1.20', 'refused', 0)])
+    eq(log['requests'][1]['error'], 'context too long')
+    eq([e['text'] for e in log['events']], ['model server started'])
+    again = M.agent_log(log['last_request'], log['last_event'])
+    eq((again['requests'], again['events']), ([], []))
+    eq((again['last_request'], again['last_event']), (log['last_request'], log['last_event']))
+    eq(len(M.agent_log(limit=1)['requests']), 1)
+
+
+def answered_only_on_the_page():
+    # a refused or failed call is a row now; the old page's numbers still count answered calls only
+    reset(); M.DB.execute('delete from requests'); M.DB.commit()
+    t = time.time() - 30
+    M.DB.execute("insert into requests(t_end, prompt_tokens, prompt_ms, gen_tokens, gen_ms, client) "
+                 "values(?, 10, 100, 20, 1000, ?)", (t, HENRY))
+    M.DB.execute("insert into requests(t_end, prompt_tokens, prompt_ms, gen_tokens, gen_ms, client, status) "
+                 "values(?, 0, 0, 0, 0, '192.168.1.20', 'refused')", (t,))
+    M.DB.commit()
+    eq(M.agg(t - 1, t + 1)['requests'], 1)
+    eq(len(M.series('1h')['table']), 1)
+
+
 # ------------------------------------------------------------------ end to end
 def end_to_end():
     # the proxy as tailscale serve meets it: in this process (so PROXIED can be read back), in front
@@ -200,7 +241,24 @@ def end_to_end():
         check('/v1 proxy refuses a wrong key', lambda: refused('Bearer nope'))
         check('/v1 proxy refuses a keyed call serve did not name', unnamed)
         check('/v1 proxy names a tagged device by its address', device_only)
+        def refused_is_a_row():
+            M.DB.execute('delete from requests'); M.DB.commit()
+            eq(post('/v1/chat/completions', 'Bearer ' + key, serve=False)[0], 403)
+            eq(M.DB.execute('select status, client from requests').fetchall(), [('refused', '127.0.0.1')])
+
+        def feed_is_local_only():
+            with urllib.request.urlopen(base + '/agent/log', timeout=5) as r:
+                eq(sorted(json.loads(r.read())), ['events', 'last_event', 'last_request', 'requests'])
+            for h in ({'X-Forwarded-For': MAC}, {'Tailscale-User-Login': HENRY}):
+                try:
+                    urllib.request.urlopen(urllib.request.Request(base + '/agent/log', headers=h), timeout=5)
+                    raise AssertionError('answered a call that came through serve: %r' % h)
+                except urllib.error.HTTPError as e:
+                    eq(e.code, 403)
+
         check('/v1/models is still answered by the monitor', models)
+        check('/v1 proxy records a refused call as a row', refused_is_a_row)
+        check('/agent/log answers this box only', feed_is_local_only)
     finally:
         srv.shutdown(); fake.send_signal(signal.SIGTERM); fake.wait(timeout=10)
 
@@ -230,6 +288,8 @@ if __name__ == '__main__':
     check('two proxied requests that could own a row claim neither', ambiguous_left_alone)
     check('tokens written are read off the end of each answer shape', tokens_read_off_the_end)
     check('the monitor finds llama-server where it was started', finds_llama_server)
+    check('/agent/log sends every call once, settled', agent_log_feed)
+    check('the page still counts answered calls only', answered_only_on_the_page)
     end_to_end()
     if fails:
         print('\n%d check(s) failed' % len(fails)); sys.exit(1)
